@@ -114,8 +114,8 @@ class OpenFrontEnv(gym.Env):
         msg = self._recv()
         obs = self._decode_obs(msg["obs"])
         reward = float(msg["reward"])
-        terminated = bool(msg["done"])  # episode ended by win/loss/timeout
-        truncated = False
+        terminated = bool(msg["done"]) and msg.get("info", {}).get("reason") != "max_ticks"
+        truncated  = bool(msg["done"]) and msg.get("info", {}).get("reason") == "max_ticks"
         return obs, reward, terminated, truncated, msg.get("info", {})
 
     def close(self):

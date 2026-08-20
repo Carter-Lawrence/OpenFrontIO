@@ -48,8 +48,8 @@ console.debug = () => {};
 const MAP = "big_plains"; // 200x200, all land. Small + dense = fast, forces conflict.
 const GAME_MAP_TYPE = GameMapType.Pangaea; // metadata; real geometry comes from MAP's .bin
 const DIFFICULTY = Difficulty.Impossible; // the opponent you ultimately want to beat
-const NUM_BOTS = 5; // start small (1-5). More bots = harder + slower.
-const MAX_TICKS = 5000; // episode length cap (~8 min of real game at 10 ticks/sec)
+const NUM_BOTS = 1; // start small (1-5). More bots = harder + slower.
+const MAX_TICKS = 25000; // episode length cap (~8 min of real game at 10 ticks/sec)
 const TICKS_PER_STEP = 10; // "action repeat": each RL step advances 1 second of game
 const GRID = 24; // observation is downsampled to GRID x GRID cells
 
@@ -57,13 +57,15 @@ const AGENT_ID = "agent";
 const AGENT_SPAWN: [number, number] = [40, 40];
 // Bot spawn points spread across the 200x200 map, away from the agent.
 const BOT_SPAWNS: [number, number][] = [
-  [160, 160],
+  [160, 160]
+  /*,
   [40, 160],
   [160, 40],
   [100, 110],
   [160, 100],
   [100, 40],
   [40, 100],
+  */
 ];
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -76,7 +78,10 @@ let game: Game;
 let agent: Player;
 let prevTiles = 0;
 let episode = 0;
-
+let totalLand = 1; // count of land tiles on the map; set in reset()
+let prevOwnFrac = 0; // agent's fraction of land last step
+let prevEnemies = 0; // enemies alive last step
+ 
 function isPlayerObj(o: unknown): o is Player {
   return !!o && typeof (o as Player).isPlayer === "function" && (o as Player).isPlayer();
 }
@@ -172,6 +177,23 @@ function buildRender(): number[] | undefined {
 async function reset() {
   episode++;
   const gameID = `rl_ep_${episode}_${Math.floor(Math.random() * 1e9)}`;
+  // computed once at reset(): const TOTAL_LAND = <count of land tiles>;
+// tracked across steps: let prevOwnFrac = 0; let prevEnemies = NUM_BOTS;
+
+  const ownFrac = agent.numTilesOwned() / TOTAL_LAND;
+  let reward = (ownFrac - prevOwnFrac) * 5.0;      // whole-map swing ≈ ±5
+  prevOwnFrac = ownFrac;
+
+  const enemiesNow = aliveEnemies().length;
+  reward += (prevEnemies - enemiesNow) * 2.0;      // +2 per enemy eliminated
+  prevEnemies = enemiesNow;
+
+  reward -= 0.01;                                   // small cost per step → be decisive
+
+  let done = false, reason = "";
+  if (!agent.isAlive())            { reward -= 5;  done = true; reason = "agent_died"; }
+  else if (enemiesNow === 0)       { reward += 10; done = true; reason = "agent_won"; }
+  else if (game.ticks() >= MAX_TICKS) {             done = true; reason = "max_ticks"; }
 
   game = await setup(
     MAP,
@@ -240,40 +262,46 @@ function applyAction(action: number) {
 
 function step(action: number) {
   applyAction(action);
-
+ 
   for (let i = 0; i < TICKS_PER_STEP; i++) {
     game.executeNextTick();
     if (!agent.isAlive()) break;
     if (game.ticks() >= MAX_TICKS) break;
   }
-
-  // Reward: shaped by change in territory, with terminal bonuses.
+ 
   const tiles = agent.numTilesOwned();
-  let reward = (tiles - prevTiles) * 0.01;
-  prevTiles = tiles;
-
+  const ownFrac = tiles / totalLand;
+  const enemiesNow = aliveEnemies().length;
+ 
+  let reward = (ownFrac - prevOwnFrac) * 5.0; // whole-map swing ~ +/-5
+  reward += (prevEnemies - enemiesNow) * 2.0; // +2 for each enemy eliminated
+  reward -= 0.01; // small time cost
+ 
+  prevOwnFrac = ownFrac;
+  prevEnemies = enemiesNow;
+ 
   let done = false;
   let reason = "";
   if (!agent.isAlive()) {
-    reward -= 10;
+    reward -= 5; // losing is bad; the fight itself was already rewarded above
     done = true;
     reason = "agent_died";
-  } else if (aliveEnemies().length === 0) {
-    reward += 10;
+  } else if (enemiesNow === 0) {
+    reward += 10; // winning is the whole point
     done = true;
     reason = "agent_won";
   } else if (game.ticks() >= MAX_TICKS) {
     done = true;
-    reason = "max_ticks";
+    reason = "max_ticks"; // a TIME LIMIT, not a real terminal — env truncates it
   }
-
+ 
   return {
     type: "step",
     obs: buildObs(),
     render: buildRender(),
     reward,
     done,
-    info: { reason, tiles, ticks: game.ticks(), enemies: aliveEnemies().length },
+    info: { reason, tiles, ticks: game.ticks(), enemies: enemiesNow },
   };
 }
 
