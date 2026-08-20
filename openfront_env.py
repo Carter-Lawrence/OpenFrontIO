@@ -112,14 +112,18 @@ class OpenFrontEnv(gym.Env):
         return self._decode_obs(msg["obs"]), {"meta": msg.get("meta", {})}
 
     def step(self, action):
-        self._mask = msg.get("mask")
         self._send({"cmd": "step", "action": int(action)})
         msg = self._recv()
+        self._mask = msg.get("mask")
         obs = self._decode_obs(msg["obs"])
         reward = float(msg["reward"])
-        terminated = bool(msg["done"]) and msg.get("info", {}).get("reason") != "max_ticks"
-        truncated  = bool(msg["done"]) and msg.get("info", {}).get("reason") == "max_ticks"
-        return obs, reward, terminated, truncated, msg.get("info", {})
+        info = msg.get("info", {})
+        done = bool(msg["done"])
+        # timeout = truncation (PPO bootstraps); win/loss = real termination
+        timed_out = info.get("reason") == "max_ticks"
+        terminated = done and not timed_out
+        truncated = done and timed_out
+        return obs, reward, terminated, truncated, info
 
     def close(self):
         if self.proc is not None and self.proc.poll() is None:
