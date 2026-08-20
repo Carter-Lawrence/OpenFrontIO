@@ -1,27 +1,16 @@
 /**
  * sim_server.ts — OpenFront headless bridge for reinforcement learning.
  *
- * You do NOT need to understand or edit the game itself. This file is the only
- * TypeScript in your project, and it just does three things:
- *   1. Builds a headless OpenFront game (one "agent" player + some Impossible bots).
- *   2. Reads one JSON command per line from stdin  (sent by your Python code).
- *   3. Writes one JSON reply per line to stdout     (read by your Python code).
- *
- * Protocol (all messages are a single line of JSON):
+ * Protocol (one line of JSON each):
  *   IN  {"cmd":"reset"}            -> OUT {"type":"reset","obs":{...},"meta":{...}}
  *   IN  {"cmd":"step","action":N}  -> OUT {"type":"step","obs":{...},"reward":R,"done":B,"info":{...}}
  *   IN  {"cmd":"close"}            -> process exits
- *
- * Normally you never run it directly — the Python environment launches it.
  */
 
 import path from "path";
 import readline from "readline";
 import { fileURLToPath } from "url";
 
-// NOTE: these paths are "./" because this file lives in the REPO ROOT, next to
-// the game's src/ and tests/ folders. If you ever move this file into a
-// subfolder, change each "./" to "../" (one "../" per folder level deeper).
 import { setup } from "./tests/util/Setup";
 import { AttackExecution } from "./src/core/execution/AttackExecution";
 import { SpawnExecution } from "./src/core/execution/SpawnExecution";
@@ -37,62 +26,59 @@ import {
   PlayerType,
 } from "./src/core/game/Game";
 
-// The game core occasionally prints to console.log. That would corrupt our
-// stdout JSON channel, so we redirect ALL console output to stderr.
+// Redirect console output to stderr so it can't corrupt the stdout JSON channel.
 console.log = (...a: unknown[]) => process.stderr.write(a.join(" ") + "\n");
 console.debug = () => {};
 
 // ============================================================================
-// CONFIG — the knobs you'll actually want to change. Everything below is plumbing.
+// CONFIG
 // ============================================================================
-const MAP = "big_plains"; // 200x200, all land. Small + dense = fast, forces conflict.
-const GAME_MAP_TYPE = GameMapType.Pangaea; // metadata; real geometry comes from MAP's .bin
-const DIFFICULTY = Difficulty.Impossible; // the opponent you ultimately want to beat
-const NUM_BOTS = 1; // start small (1-5). More bots = harder + slower.
-const MAX_TICKS = 25000; // episode length cap (~8 min of real game at 10 ticks/sec)
-const TICKS_PER_STEP = 10; // "action repeat": each RL step advances 1 second of game
-const GRID = 24; // observation is downsampled to GRID x GRID cells
+const MAP = "big_plains"; // 200x200, all land.
+const GAME_MAP_TYPE = GameMapType.Pangaea;
+const DIFFICULTY = Difficulty.Impossible;
+const NUM_BOTS = 5;
+const MAX_TICKS = 25000; // 25000 ticks / TICKS_PER_STEP(10) = 2500 RL steps/episode
+const TICKS_PER_STEP = 10;
+const GRID = 24;
 
 const AGENT_ID = "agent";
 const AGENT_SPAWN: [number, number] = [40, 40];
-// Bot spawn points spread across the 200x200 map, away from the agent.
+// Bots ring the agent (at 40,40) so conflict is unavoidable within a couple
+// hundred ticks, instead of exiled to the far corners where the agent could
+// farm free land forever and never fight.
 const BOT_SPAWNS: [number, number][] = [
-  [160, 160]
-  /*,
-  [40, 160],
-  [160, 40],
-  [100, 110],
-  [160, 100],
-  [100, 40],
-  [40, 100],
-  */
+  [40, 10],
+  [10, 40],
+  [90, 40],
+  [40, 90],
+  [80, 80],
+  [10, 80],
+  [80, 10],
 ];
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const MAP_DIR = path.join(HERE, "tests", "util"); // repo-root/tests/util (map files)
+const MAP_DIR = path.join(HERE, "tests", "util");
 
 // ----------------------------------------------------------------------------
 // Episode state
 // ----------------------------------------------------------------------------
 let game: Game;
 let agent: Player;
-let prevTiles = 0;
 let episode = 0;
-let totalLand = 1; // count of land tiles on the map; set in reset()
-let prevOwnFrac = 0; // agent's fraction of land last step
+
+// Reward bookkeeping — declared at module scope so reset() and step() share them.
+let totalLand = 1; // land tiles on the map; set in reset()
+let prevOwnFrac = 0; // agent's fraction of the land last step
 let prevEnemies = 0; // enemies alive last step
- 
+
 function isPlayerObj(o: unknown): o is Player {
   return !!o && typeof (o as Player).isPlayer === "function" && (o as Player).isPlayer();
 }
 
 function aliveEnemies(): Player[] {
-  return game
-    .players()
-    .filter((p) => p.id() !== AGENT_ID && p.isAlive());
+  return game.players().filter((p) => p.id() !== AGENT_ID && p.isAlive());
 }
 
-// Enemies that border the agent, sorted weakest -> strongest by troops.
 function borderingEnemies(): Player[] {
   const near = agent
     .nearby()
@@ -104,8 +90,7 @@ function borderingEnemies(): Player[] {
 }
 
 // ----------------------------------------------------------------------------
-// Observation: a downsampled map grid + a few scalar features.
-//   grid cell values: 0 = ocean, 1 = neutral land, 2 = agent, 3 = enemy
+// Observation grid (0=ocean, 1=neutral, 2=agent, 3=enemy) + scalars
 // ----------------------------------------------------------------------------
 function buildObs() {
   const w = game.width();
@@ -141,10 +126,7 @@ function buildObs() {
 }
 
 // ----------------------------------------------------------------------------
-// Higher-resolution per-player ownership map for the wall-of-games viewer.
-// Only built when the OF_RENDER env var is set, so it never slows training.
-//   cell values: -1 = ocean, 0 = neutral land, >0 = that player's smallID
-// Set OF_RENDER=1 for the default 80x80, or OF_RENDER=120 for a finer map.
+// High-res per-player map for the wall viewer (only when OF_RENDER is set)
 // ----------------------------------------------------------------------------
 const RENDER = !!process.env.OF_RENDER;
 const RENDER_SIZE = Number(process.env.OF_RENDER) > 1 ? Number(process.env.OF_RENDER) : 80;
@@ -177,23 +159,6 @@ function buildRender(): number[] | undefined {
 async function reset() {
   episode++;
   const gameID = `rl_ep_${episode}_${Math.floor(Math.random() * 1e9)}`;
-  // computed once at reset(): const TOTAL_LAND = <count of land tiles>;
-// tracked across steps: let prevOwnFrac = 0; let prevEnemies = NUM_BOTS;
-
-  const ownFrac = agent.numTilesOwned() / TOTAL_LAND;
-  let reward = (ownFrac - prevOwnFrac) * 5.0;      // whole-map swing ≈ ±5
-  prevOwnFrac = ownFrac;
-
-  const enemiesNow = aliveEnemies().length;
-  reward += (prevEnemies - enemiesNow) * 2.0;      // +2 per enemy eliminated
-  prevEnemies = enemiesNow;
-
-  reward -= 0.01;                                   // small cost per step → be decisive
-
-  let done = false, reason = "";
-  if (!agent.isAlive())            { reward -= 5;  done = true; reason = "agent_died"; }
-  else if (enemiesNow === 0)       { reward += 10; done = true; reason = "agent_won"; }
-  else if (game.ticks() >= MAX_TICKS) {             done = true; reason = "max_ticks"; }
 
   game = await setup(
     MAP,
@@ -201,30 +166,39 @@ async function reset() {
     [],
     MAP_DIR,
     undefined,
-    false, // don't auto-end the spawn phase; we manage it
+    false,
   );
 
-  // IMPORTANT ordering: add the bots FIRST and let them spawn. The spawn phase
-  // auto-ends once a *human* has spawned, so if we added the agent first it would
-  // close the phase before the bots ever claimed territory.
+  // Bots FIRST (the spawn phase auto-ends once a human spawns).
   for (let i = 0; i < Math.min(NUM_BOTS, BOT_SPAWNS.length); i++) {
     const [x, y] = BOT_SPAWNS[i];
     const info = new PlayerInfo(`bot_${i}`, PlayerType.Nation, null, `bot_${i}`);
     game.addExecution(new NationExecution(gameID, new Nation(new Cell(x, y), info)));
   }
-  // Let the bots claim their starting territory (they spawn within ~3 ticks).
   for (let i = 0; i < 6; i++) game.executeNextTick();
 
-  // Now add the agent (a normal Human player) and spawn it.
+  // Then the agent.
   const agentInfo = new PlayerInfo(AGENT_ID, PlayerType.Human, null, AGENT_ID);
   game.addPlayer(agentInfo);
   game.addExecution(new SpawnExecution(gameID, agentInfo, game.ref(...AGENT_SPAWN)));
-  for (let i = 0; i < 4; i++) game.executeNextTick(); // agent spawns; phase auto-ends
-  game.endSpawnPhase(); // safety: ensure we're out of the spawn phase
+  for (let i = 0; i < 4; i++) game.executeNextTick();
+  game.endSpawnPhase();
 
   agent = game.player(AGENT_ID);
   agentSmallID = agent.smallID();
-  prevTiles = agent.numTilesOwned();
+
+  // Count land tiles once so territory can be a fraction in [0,1].
+  totalLand = 0;
+  const w = game.width();
+  const h = game.height();
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) {
+      if (game.isLand(game.ref(x, y))) totalLand++;
+    }
+  }
+  if (totalLand < 1) totalLand = 1;
+  prevOwnFrac = agent.numTilesOwned() / totalLand;
+  prevEnemies = aliveEnemies().length;
 
   return {
     type: "reset",
@@ -248,7 +222,6 @@ function applyAction(action: number) {
   if (troops <= 0) return;
 
   if (action === 1) {
-    // Expand into neutral territory (attack with null target).
     game.addExecution(new AttackExecution(troops, agent, null, null));
   } else if (action === 2 || action === 3) {
     const enemies = borderingEnemies();
@@ -257,44 +230,44 @@ function applyAction(action: number) {
       game.addExecution(new AttackExecution(troops, agent, target.id(), null));
     }
   }
-  // action === 0 is no-op.
 }
 
 function step(action: number) {
   applyAction(action);
- 
+
   for (let i = 0; i < TICKS_PER_STEP; i++) {
     game.executeNextTick();
     if (!agent.isAlive()) break;
     if (game.ticks() >= MAX_TICKS) break;
   }
- 
+
+  // ---- Reward (lives HERE in step(), not reset()) ----
   const tiles = agent.numTilesOwned();
   const ownFrac = tiles / totalLand;
   const enemiesNow = aliveEnemies().length;
- 
-  let reward = (ownFrac - prevOwnFrac) * 5.0; // whole-map swing ~ +/-5
-  reward += (prevEnemies - enemiesNow) * 2.0; // +2 for each enemy eliminated
+
+  let reward = (ownFrac - prevOwnFrac) * 5.0; // territory share swing
+  reward += (prevEnemies - enemiesNow) * 2.0; // +2 per enemy eliminated
   reward -= 0.01; // small time cost
- 
+
   prevOwnFrac = ownFrac;
   prevEnemies = enemiesNow;
- 
+
   let done = false;
   let reason = "";
   if (!agent.isAlive()) {
-    reward -= 5; // losing is bad; the fight itself was already rewarded above
+    reward -= 5;
     done = true;
     reason = "agent_died";
   } else if (enemiesNow === 0) {
-    reward += 10; // winning is the whole point
+    reward += 10;
     done = true;
     reason = "agent_won";
   } else if (game.ticks() >= MAX_TICKS) {
     done = true;
-    reason = "max_ticks"; // a TIME LIMIT, not a real terminal — env truncates it
+    reason = "max_ticks";
   }
- 
+
   return {
     type: "step",
     obs: buildObs(),
@@ -306,7 +279,7 @@ function step(action: number) {
 }
 
 // ----------------------------------------------------------------------------
-// stdio loop: one JSON command per line, replies serialized in order.
+// stdio loop
 // ----------------------------------------------------------------------------
 const rl = readline.createInterface({ input: process.stdin });
 let chain: Promise<void> = Promise.resolve();
