@@ -45,7 +45,7 @@ class OpenFrontEnv(gym.Env):
 
     def __init__(self):
         super().__init__()
-        self.action_space = spaces.Discrete(4)
+        self.action_space = spaces.Discrete(9)
         self.observation_space = spaces.Dict(
             {
                 "grid": spaces.Box(low=0, high=3, shape=(GRID, GRID), dtype=np.int8),
@@ -56,6 +56,7 @@ class OpenFrontEnv(gym.Env):
             }
         )
         self.proc = None
+        self._mask = None  # last mask received from sim_server
 
     # -- subprocess plumbing -------------------------------------------------
     def _start(self):
@@ -107,9 +108,11 @@ class OpenFrontEnv(gym.Env):
             self._start()
         self._send({"cmd": "reset"})
         msg = self._recv()
+        self._mask = msg.get("mask")
         return self._decode_obs(msg["obs"]), {"meta": msg.get("meta", {})}
 
     def step(self, action):
+        self._mask = msg.get("mask")
         self._send({"cmd": "step", "action": int(action)})
         msg = self._recv()
         obs = self._decode_obs(msg["obs"])
@@ -130,6 +133,10 @@ class OpenFrontEnv(gym.Env):
                 self.proc.kill()
         self.proc = None
 
+    def action_masks(self):
+        if self._mask is None:
+            return np.ones(self.action_space.n, dtype=bool)
+        return np.array(self._mask, dtype=bool)
 
 # ---------------------------------------------------------------------------
 # Smoke test: run a few episodes with a RANDOM agent and print what happens.

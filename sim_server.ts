@@ -13,6 +13,7 @@ import { fileURLToPath } from "url";
 
 import { setup } from "./tests/util/Setup";
 import { AttackExecution } from "./src/core/execution/AttackExecution";
+import { ConstructionExecution } from "./src/core/execution/ConstructionExecution";
 import { SpawnExecution } from "./src/core/execution/SpawnExecution";
 import { NationExecution } from "./src/core/execution/NationExecution";
 import {
@@ -24,8 +25,8 @@ import {
   Player,
   PlayerInfo,
   PlayerType,
+  UnitType,
 } from "./src/core/game/Game";
-
 // Redirect console output to stderr so it can't corrupt the stdout JSON channel.
 console.log = (...a: unknown[]) => process.stderr.write(a.join(" ") + "\n");
 console.debug = () => {};
@@ -89,6 +90,66 @@ function borderingEnemies(): Player[] {
   return near.sort((a, b) => a.troops() - b.troops());
 }
 
+// Action indices 4-8 map to structures the agent can build. Placement is
+// heuristic (the bridge finds a valid owned tile); the agent only picks WHAT.
+const BUILD_ACTIONS: Record<number, UnitType> = {
+  4: UnitType.City,        // economy: more population/troop income
+  5: UnitType.Port,        // economy + unlocks naval
+  6: UnitType.Factory,     // economy/production
+  7: UnitType.DefensePost, // defensive bonus on nearby tiles
+  8: UnitType.SAMLauncher, // shoots down incoming nukes
+};
+
+// Try to build `type` on one of the agent's tiles. Returns true if queued.
+function tryBuild(type: UnitType): boolean {
+  const border = Array.from(agent.borderTiles());
+  if (border.length === 0) return false;
+  const stride = Math.max(1, Math.floor(border.length / 40)); // sample ~40 tiles
+  for (let i = 0; i < border.length; i += stride) {
+    const spot = agent.canBuild(type, border[i]); // TileRef if legal, else false
+    if (spot !== false) {
+      game.addExecution(new ConstructionExecution(agent, type, spot));
+      return true;
+    }
+  }
+  return false;
+}
+
+// Boolean legality per action, so PPO never wastes a step on an illegal move.
+function computeMask(): boolean[] {
+  // [noop, expand, atkWeak, atkStrong, city, port, factory, defense, sam]
+  if (!agent || !agent.isAlive()) {
+    return [true, false, false, false, false, false, false, false, false];
+  }
+  const mask = [true, true, false, false, false, false, false, false, false];
+  const hasEnemyBorder = borderingEnemies().length > 0;
+  mask[2] = hasEnemyBorder;
+  mask[3] = hasEnemyBorder;
+
+  const border = Array.from(agent.borderTiles());
+  if (border.length > 0) {
+    const gold = agent.gold();
+    const list = agent.buildableUnits(border[0], [
+      UnitType.City,
+      UnitType.Port,
+      UnitType.Factory,
+      UnitType.DefensePost,
+      UnitType.SAMLauncher,
+    ]);
+    const idx: Record<string, number> = {
+      [UnitType.City]: 4,
+      [UnitType.Port]: 5,
+      [UnitType.Factory]: 6,
+      [UnitType.DefensePost]: 7,
+      [UnitType.SAMLauncher]: 8,
+    };
+    for (const b of list) {
+      const i = idx[b.type];
+      if (i !== undefined) mask[i] = gold >= b.cost; // affordable = legal
+    }
+  }
+  return mask;
+}
 // ----------------------------------------------------------------------------
 // Observation grid (0=ocean, 1=neutral, 2=agent, 3=enemy) + scalars
 // ----------------------------------------------------------------------------
@@ -204,9 +265,10 @@ async function reset() {
     type: "reset",
     obs: buildObs(),
     render: buildRender(),
+    mask: computeMask(),
     meta: {
       grid: GRID,
-      nActions: 4,
+      nActions: 9,
       nScalars: 6,
       map: MAP,
       bots: NUM_BOTS,
@@ -218,18 +280,23 @@ async function reset() {
 
 function applyAction(action: number) {
   if (!agent.isAlive()) return;
-  const troops = Math.floor(agent.troops() * 0.5);
-  if (troops <= 0) return;
 
   if (action === 1) {
-    game.addExecution(new AttackExecution(troops, agent, null, null));
+    const troops = Math.floor(agent.troops() * 0.5);
+    if (troops > 0) game.addExecution(new AttackExecution(troops, agent, null, null));
   } else if (action === 2 || action === 3) {
+    const troops = Math.floor(agent.troops() * 0.5);
+    if (troops <= 0) return;
     const enemies = borderingEnemies();
     if (enemies.length > 0) {
       const target = action === 2 ? enemies[0] : enemies[enemies.length - 1];
       game.addExecution(new AttackExecution(troops, agent, target.id(), null));
     }
+  } else if (action >= 4 && action <= 8) {
+    const type = BUILD_ACTIONS[action];
+    if (type) tryBuild(type);
   }
+  // action === 0 is no-op
 }
 
 function step(action: number) {
@@ -248,7 +315,7 @@ function step(action: number) {
 
   let reward = (ownFrac - prevOwnFrac) * 5.0; // territory share swing
   reward += (prevEnemies - enemiesNow) * 2.0; // +2 per enemy eliminated
-  reward -= 0.01; // small time cost
+  reward -= 0.005; // small time cost
 
   prevOwnFrac = ownFrac;
   prevEnemies = enemiesNow;
@@ -272,6 +339,7 @@ function step(action: number) {
     type: "step",
     obs: buildObs(),
     render: buildRender(),
+    mask: computeMask(),
     reward,
     done,
     info: { reason, tiles, ticks: game.ticks(), enemies: enemiesNow },

@@ -134,12 +134,17 @@ def newest_checkpoint(path):
 
 
 def try_load(path):
-    from stable_baselines3 import PPO
-    import model_def  # noqa: F401  makes the custom network class importable
+    from sb3_contrib import MaskablePPO
     try:
-        return PPO.load(path, device="cpu")
+        import model_def  # noqa: F401
+        _ = model_def.OpenFrontCNN
     except Exception as ex:
-        print(f"  (couldn't load {os.path.basename(path)} yet: {ex})")
+        print(f"  (can't import OpenFrontCNN: {type(ex).__name__}: {ex})")
+        return None
+    try:
+        return MaskablePPO.load(path, device="cpu")
+    except Exception as ex:
+        print(f"  (couldn't load {os.path.basename(path)}: {type(ex).__name__}: {ex})")
         return None
 
 
@@ -202,8 +207,15 @@ def main():
                     print(f"↻ now watching: {os.path.basename(newest)}")
 
         for i, g in enumerate(games):
-            action = (model.predict(obs_for_model(states[i]), deterministic=True)[0]
-                      if model else np.random.randint(4))
+            if model:
+                mask = states[i].get("mask")
+                action = model.predict(
+                    obs_for_model(states[i]),
+                    action_masks=(np.array(mask, dtype=bool) if mask else None),
+                    deterministic=True,
+                )[0]
+            else:
+                action = np.random.randint(9)
             g.send_step(action)
             msg = g.recv()
             if msg.get("done"):
