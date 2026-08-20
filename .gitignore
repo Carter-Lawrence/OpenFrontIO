@@ -1,0 +1,12 @@
+# Ignore everything in the repo (all the OpenFront game code stays on disk,
+# runnable, but out of YOUR git repo)...
+/*
+
+# ...except the files you actually wrote:
+!sim_server.ts
+!openfront_env.py
+!watch_wall.py
+!model_def.py
+!OpenFrontCNNV1.py
+!README.md
+!.gitignore
